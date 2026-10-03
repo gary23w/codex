@@ -228,6 +228,31 @@ impl UnifiedExecProcess {
         }
     }
 
+    /// Enforce a lifetime independent of tool polling, yielding, or turn cancellation.
+    /// The weak reference lets normal process cleanup run before the deadline.
+    pub(super) fn enforce_timeout(self: &Arc<Self>, timeout: Duration) -> JoinHandle<()> {
+        let process = Arc::downgrade(self);
+        let exited = self.cancellation_token();
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = exited.cancelled() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    let Some(process) = process.upgrade() else {
+                        return;
+                    };
+                    if !process.has_exited() {
+                        process.mark_timed_out();
+                        if let Err(err) = process.terminate_confirmed().await {
+                            process.fail_and_terminate(err.to_string());
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     pub(super) fn mark_timed_out(&self) {
         self.timed_out.store(true, Ordering::Release);
     }

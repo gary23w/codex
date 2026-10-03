@@ -86,6 +86,7 @@ use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_protocol::shell_environment::is_non_inheritable_env_var;
 use codex_sandboxing::SandboxCommand;
 use codex_shell_command::is_dangerous_command::DangerousCommandPlatform;
+use codex_shell_command::search_command::is_search_only_command;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use codex_utils_path_uri::PathUri;
@@ -106,6 +107,7 @@ const NETWORK_ACCESS_DENIED_MESSAGE: &str =
     "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
 const MAX_STDIN_APPROVAL_BYTES: usize = 8_000;
+const SEARCH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const INTERRUPT: &str = "\u{3}";
 
 /// Test-only override for deterministic unified exec process IDs.
@@ -544,6 +546,11 @@ impl UnifiedExecProcessManager {
         let process = Arc::new(process);
         if let Some(completion) = completion.as_ref() {
             let _ = completion.process.set(Arc::clone(&process));
+        } else if !request.tty && is_search_only_command(&request.command) {
+            // A yielded search must not run indefinitely if its caller loses the
+            // session ID or abandons the turn. Keep normal polling semantics, but
+            // enforce a wall-clock deadline independent of the calling tool future.
+            drop(process.enforce_timeout(SEARCH_COMMAND_TIMEOUT));
         }
         let network_denial_monitor = deferred_network_approval.as_ref().map(|deferred| {
             terminate_process_on_network_denial(
@@ -732,10 +739,7 @@ impl UnifiedExecProcessManager {
                     {
                         return Err(fail_process_with_message(entry.process.as_ref(), message));
                     }
-                    if !completion
-                        .as_ref()
-                        .is_some_and(|completion| completion.timed_out)
-                    {
+                    if !process.timed_out() {
                         process
                             .check_for_sandbox_denial_with_text(&text)
                             .await

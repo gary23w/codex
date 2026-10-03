@@ -13,6 +13,9 @@ use codex_exec_server::WriteStatus;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -21,6 +24,7 @@ struct MockExecProcess {
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
     terminate_error: Option<String>,
+    terminate_calls: Arc<AtomicUsize>,
     wake_tx: watch::Sender<u64>,
 }
 
@@ -43,6 +47,7 @@ impl MockExecProcess {
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
+        self.terminate_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(message) = &self.terminate_error {
             return Err(ExecServerError::Protocol(message.clone()));
         }
@@ -90,6 +95,17 @@ pub(super) async fn remote_process(
     terminate_error: Option<String>,
     sandbox_type: impl Into<Option<codex_sandboxing::SandboxType>>,
 ) -> UnifiedExecProcess {
+    tracked_remote_process(write_status, terminate_error, sandbox_type)
+        .await
+        .0
+}
+
+async fn tracked_remote_process(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+    sandbox_type: impl Into<Option<codex_sandboxing::SandboxType>>,
+) -> (UnifiedExecProcess, Arc<AtomicUsize>) {
+    let terminate_calls = Arc::new(AtomicUsize::new(0));
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
@@ -99,14 +115,16 @@ pub(super) async fn remote_process(
             },
             read_responses: Mutex::new(VecDeque::new()),
             terminate_error,
+            terminate_calls: Arc::clone(&terminate_calls),
             wake_tx,
         }),
         sandbox_type: sandbox_type.into(),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started)
+    let process = UnifiedExecProcess::from_exec_server_started(started)
         .await
-        .expect("remote process should start")
+        .expect("remote process should start");
+    (process, terminate_calls)
 }
 
 #[tokio::test]
@@ -212,4 +230,76 @@ async fn remote_process_preserves_executor_sandbox_type() {
         .await;
         assert_eq!(process.sandbox_type(), sandbox_type);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_deadline_terminates_unpolled_process() {
+    let (process, terminate_calls) =
+        tracked_remote_process(WriteStatus::Accepted, None, None).await;
+    let process = Arc::new(process);
+    // Dropping the task handle models a caller that never polls its yielded session.
+    drop(process.enforce_timeout(Duration::from_secs(60)));
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(!process.has_exited());
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 0);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    process.cancellation_token().cancelled().await;
+    assert!(process.has_exited());
+    assert!(process.timed_out());
+    assert_eq!(process.exit_code(), Some(124));
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_deadline_preserves_an_earlier_exit() {
+    let (process, terminate_calls) =
+        tracked_remote_process(WriteStatus::Accepted, None, None).await;
+    let process = Arc::new(process);
+    let deadline = process.enforce_timeout(Duration::from_secs(60));
+    process.terminate_confirmed().await.unwrap();
+    let exit_code = process.exit_code();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    deadline.await.unwrap();
+
+    assert!(!process.timed_out());
+    assert_eq!(process.exit_code(), exit_code);
+    assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_deadline_does_not_retain_a_dropped_process() {
+    let process = Arc::new(remote_process(WriteStatus::Accepted, None, None).await);
+    let weak = Arc::downgrade(&process);
+    let deadline = process.enforce_timeout(Duration::from_secs(60));
+    tokio::task::yield_now().await;
+    drop(process);
+
+    assert!(weak.upgrade().is_none());
+    deadline.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_deadline_reports_termination_failure() {
+    let process = Arc::new(
+        remote_process(
+            WriteStatus::Accepted,
+            Some("terminate unavailable".to_string()),
+            None,
+        )
+        .await,
+    );
+    let deadline = process.enforce_timeout(Duration::from_secs(60));
+    tokio::time::advance(Duration::from_secs(60)).await;
+    deadline.await.unwrap();
+
+    assert!(process.timed_out());
+    assert!(process.has_exited());
+    assert!(
+        process
+            .failure_message()
+            .is_some_and(|message| message.contains("terminate unavailable"))
+    );
 }
