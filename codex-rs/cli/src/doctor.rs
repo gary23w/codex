@@ -78,6 +78,7 @@ mod desktop;
 mod disk;
 mod filesystem_paths;
 mod git;
+mod git_objects;
 mod network;
 mod output;
 mod progress;
@@ -428,6 +429,7 @@ async fn build_report(
                 sandbox_check,
                 terminal_check,
                 git_check,
+                git_objects_check,
                 terminal_title_check,
                 state_check,
                 thread_inventory_check,
@@ -481,6 +483,11 @@ async fn build_report(
                     run_sync_check("git", progress.clone(), || git_check(config.cwd.as_path()))
                 },
                 async {
+                    run_sync_check("git objects", progress.clone(), || {
+                        git_objects::check(config.cwd.as_path())
+                    })
+                },
+                async {
                     run_sync_check("terminal title", progress.clone(), || {
                         terminal_title_check(config)
                     })
@@ -519,6 +526,7 @@ async fn build_report(
                 filesystem_paths_check,
                 terminal_check,
                 git_check,
+                git_objects_check,
                 terminal_title_check,
                 state_check,
                 thread_inventory_check,
@@ -533,6 +541,7 @@ async fn build_report(
                 network_check,
                 terminal_check,
                 git_check,
+                git_objects_check,
                 state_check,
                 reachability_check,
             ) = tokio::join!(
@@ -548,6 +557,9 @@ async fn build_report(
                     })
                 },
                 async { run_sync_check("git", progress.clone(), || git_check(&cwd)) },
+                async {
+                    run_sync_check("git objects", progress.clone(), || git_objects::check(&cwd))
+                },
                 async { run_sync_check("state", progress.clone(), fallback_state_check) },
                 run_async_check(
                     "provider reachability",
@@ -560,6 +572,7 @@ async fn build_report(
                 network_check,
                 terminal_check,
                 git_check,
+                git_objects_check,
                 state_check,
                 reachability_check,
             ]);
